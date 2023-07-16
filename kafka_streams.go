@@ -2,9 +2,12 @@ package kafkastreams
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type Message[T any] interface {
@@ -20,26 +23,50 @@ type Stream[T any] chan T
 func Streams[T any](reader Reader[T], bufferSize int, cancel chan bool) chan T {
 	res := make(chan T, bufferSize)
 
+	workerGroup, groupCtx := errgroup.WithContext(context.Background())
+	ctx, cancelGroup := context.WithCancel(groupCtx)
+
+	workerGroup.SetLimit(5)
+
 	go func() {
-		ctx, localCancel := context.WithCancel(context.Background())
 		for {
 			select {
-			case <-cancel:
-				localCancel()
-				break
+			case <-ctx.Done():
+				return
 			default:
-				msg, err := reader.ReadMessage(ctx)
-				if err != nil {
-					if strings.Contains(err.Error(), "context canceled") {
-						break
+				workerGroup.Go(func() error {
+					msg, err := reader.ReadMessage(ctx)
+					if err != nil {
+						if strings.Contains(err.Error(), "context canceled") {
+							return nil
+						}
+						log.Println("Error reading message:", err)
+						time.Sleep(time.Second)
+
+						return nil
 					}
-					log.Println("Error reading message:", err)
-					time.Sleep(time.Second)
-					continue
-				}
-				res <- msg
+
+					select {
+					case <-ctx.Done():
+						return nil
+					case res <- msg:
+						return nil
+					}
+				})
 			}
 		}
+	}()
+
+	go func() {
+		<-cancel
+		cancelGroup()
+
+		err := workerGroup.Wait()
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		close(res)
 	}()
 
 	return res
